@@ -14,6 +14,12 @@
  *    not using getLastRow() (which can be affected by stray content far below).
  * 3) STATUS accepts "ACTIVE", "ACTIVE.", "ACTIVE " etc. via startsWith("ACTIVE").
  *
+ * ACCESS CONTROL:
+ * - PMO runs core directly (menu click)
+ * - hrassist@butlerleather.com routes via Web App (runs as PMO)
+ * - All others: blocked at client gate
+ * - HashWatcher calls runLeaveMasterSyncSilent_() directly — unaffected
+ *
  * IMPORTANT:
  * - Do NOT redeclare EMPLOYEE_MASTER_SPREADSHEET_ID / EMPLOYEE_MASTER_GID here
  *   if they already exist in your HashWatcher file. If you see
@@ -25,6 +31,14 @@
 
 // --- TARGET SHEET ---
 const LEAVE_MASTER_SHEET_NAME = "LEAVE_MASTER";
+
+// --- ACCESS CONTROL ---
+const LM_PMO_EMAIL    = "pmo@butlerleather.com";
+const LM_ALLOWED_USER = "hrassist@butlerleather.com";
+const LM_WEBAPP_URL   = "https://script.google.com/macros/s/AKfycbzDSkLs-XXHgVakilwLWzLxR_gXSoWOGEBIReUPX1thXn50ztO-Tv9ZdSEflvYdQ0ME/exec";
+
+// --- LEAVE MASTER SPREADSHEET ID ---
+const LEAVE_MASTER_SPREADSHEET_ID = "1kVV5Vu8dPGdgGSAu7rZCz9I9L0XlJiQBE-Opv7izDfk";
 
 // Employee Master headers (source of truth)
 const EM_HEADERS = {
@@ -56,9 +70,19 @@ function onOpen() {
 
 /**
  * Manual run: confirmation + summary
+ * - PMO        → runs core directly
+ * - hrassist   → routes via Web App (runs as PMO)
+ * - Others     → blocked
  */
 function syncLeaveMasterActiveStaffManual() {
   const ui = SpreadsheetApp.getUi();
+  const caller = Session.getActiveUser().getEmail();
+
+  if (caller !== LM_PMO_EMAIL && caller !== LM_ALLOWED_USER) {
+    ui.alert("Not authorised to run this sync.");
+    return;
+  }
+
   const resp = ui.alert(
     "Sync Leave Master (ACTIVE STAFF only)",
     "This will:\n• Add new ACTIVE STAFF employees\n• Remove anyone who is not ACTIVE STAFF (delete full rows)\n• Update ID/Name/Category/DOJ for existing ACTIVE STAFF (balances preserved)\n\nProceed?",
@@ -66,12 +90,78 @@ function syncLeaveMasterActiveStaffManual() {
   );
   if (resp !== ui.Button.YES) return;
 
-  const result = syncLeaveMasterActiveStaffCore_();
-  ui.alert(`Sync complete.\nAdded: ${result.added}\nRemoved: ${result.removed}\nUpdated: ${result.updated}`);
+  // PMO runs directly
+  if (caller === LM_PMO_EMAIL) {
+    const result = syncLeaveMasterActiveStaffCore_();
+    ui.alert(`Sync complete.\nAdded: ${result.added}\nRemoved: ${result.removed}\nUpdated: ${result.updated}`);
+    return;
+  }
+
+  // hrassist routes via Web App
+  _callLeaveMasterSyncWebApp_(caller, ui);
 }
 
 /**
- * Called by hash watcher (silent)
+ * Web App caller — used by hrassist only
+ */
+function _callLeaveMasterSyncWebApp_(caller, ui) {
+  const payload = {
+    action: "syncLeaveMaster",
+    spreadsheetId: LEAVE_MASTER_SPREADSHEET_ID,
+    requestedBy: caller,
+  };
+
+  const response = UrlFetchApp.fetch(LM_WEBAPP_URL, {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true,
+  });
+
+  const result = JSON.parse(response.getContentText());
+
+  if (result.success) {
+    ui.alert(`Sync complete.\nAdded: ${result.added}\nRemoved: ${result.removed}\nUpdated: ${result.updated}`);
+  } else {
+    ui.alert(`Sync failed: ${result.message}`);
+  }
+}
+
+/**
+ * Web App entry point
+ * - Server gate: validates requestedBy === LM_ALLOWED_USER
+ * - Runs core as PMO (Web App deployed as PMO)
+ */
+function doPost(e) {
+  try {
+    const payload = JSON.parse(e.postData.contents);
+
+    if (payload.action === "syncLeaveMaster") {
+      if (payload.requestedBy !== LM_ALLOWED_USER) {
+        return ContentService.createTextOutput(
+          JSON.stringify({ success: false, message: "Access denied." })
+        ).setMimeType(ContentService.MimeType.JSON);
+      }
+
+      const result = syncLeaveMasterActiveStaffCore_();
+      return ContentService.createTextOutput(
+        JSON.stringify({ success: true, ...result })
+      ).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    return ContentService.createTextOutput(
+      JSON.stringify({ success: false, message: "Unknown action." })
+    ).setMimeType(ContentService.MimeType.JSON);
+
+  } catch (err) {
+    return ContentService.createTextOutput(
+      JSON.stringify({ success: false, message: err.message })
+    ).setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+/**
+ * Called by hash watcher (silent) — unaffected by Web App changes
  */
 function runLeaveMasterSyncSilent_() {
   syncLeaveMasterActiveStaffCore_();
@@ -79,9 +169,11 @@ function runLeaveMasterSyncSilent_() {
 
 /**
  * Core logic (no UI)
+ * - Called directly by PMO (menu) and HashWatcher (trigger)
+ * - Called via Web App when hrassist triggers
  */
 function syncLeaveMasterActiveStaffCore_() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ss = SpreadsheetApp.openById(LEAVE_MASTER_SPREADSHEET_ID);
   const lmSheet = ss.getSheetByName(LEAVE_MASTER_SHEET_NAME);
   if (!lmSheet) throw new Error(`Sheet not found: ${LEAVE_MASTER_SHEET_NAME}`);
 
@@ -105,10 +197,10 @@ function syncLeaveMasterActiveStaffCore_() {
   const lastCol = lmSheet.getLastColumn();
   const values = lmSheet.getRange(2, 1, dataRowCount, lastCol).getValues();
 
-  const idCol = lmHeaderMap[normalizeKey_(LM_HEADERS.ID)];
+  const idCol  = lmHeaderMap[normalizeKey_(LM_HEADERS.ID)];
   const nameCol = lmHeaderMap[normalizeKey_(LM_HEADERS.NAME)];
-  const catCol = lmHeaderMap[normalizeKey_(LM_HEADERS.CATEGORY)];
-  const dojCol = lmHeaderMap[normalizeKey_(LM_HEADERS.DOJ)];
+  const catCol  = lmHeaderMap[normalizeKey_(LM_HEADERS.CATEGORY)];
+  const dojCol  = lmHeaderMap[normalizeKey_(LM_HEADERS.DOJ)];
 
   // Build map of first occurrence by ID + collect duplicates for deletion
   const firstById = new Map();
@@ -141,10 +233,10 @@ function syncLeaveMasterActiveStaffCore_() {
   uniqueDelete.forEach(r => lmSheet.deleteRow(r));
 
   // Re-read after deletions
-  const newLastRow = lmSheet.getLastRow();
+  const newLastRow   = lmSheet.getLastRow();
   const newDataCount = Math.max(0, newLastRow - 1);
-  const newLastCol = lmSheet.getLastColumn();
-  const newValues = newDataCount
+  const newLastCol   = lmSheet.getLastColumn();
+  const newValues    = newDataCount
     ? lmSheet.getRange(2, 1, newDataCount, newLastCol).getValues()
     : [];
 
@@ -172,22 +264,22 @@ function syncLeaveMasterActiveStaffCore_() {
     const master = activeStaffMap[id];
     const cur = ex.row;
 
-    const curId = normalizeCell_(cur[idCol]);
+    const curId  = normalizeCell_(cur[idCol]);
     const curName = normalizeCell_(cur[nameCol]);
-    const curCat = normalizeCell_(cur[catCol]).toUpperCase();
-    const curDoj = normalizeDateComparable_(cur[dojCol]);
+    const curCat  = normalizeCell_(cur[catCol]).toUpperCase();
+    const curDoj  = normalizeDateComparable_(cur[dojCol]);
 
-    const mId = normalizeCell_(master.id);
-    const mName = normalizeCell_(master.name);
-    const mCat = normalizeCell_(master.category).toUpperCase(); // "STAFF"
+    const mId     = normalizeCell_(master.id);
+    const mName   = normalizeCell_(master.name);
+    const mCat    = normalizeCell_(master.category).toUpperCase();
     const mDojComp = normalizeDateComparable_(master.doj);
 
     if (curId !== mId || curName !== mName || curCat !== mCat || curDoj !== mDojComp) {
       const rowNum = ex.sheetRow;
-      lmSheet.getRange(rowNum, idCol + 1).setValue(master.id);
+      lmSheet.getRange(rowNum, idCol  + 1).setValue(master.id);
       lmSheet.getRange(rowNum, nameCol + 1).setValue(master.name);
-      lmSheet.getRange(rowNum, catCol + 1).setValue(master.category); // "STAFF"
-      lmSheet.getRange(rowNum, dojCol + 1).setValue(master.doj);
+      lmSheet.getRange(rowNum, catCol  + 1).setValue(master.category);
+      lmSheet.getRange(rowNum, dojCol  + 1).setValue(master.doj);
       updated++;
     }
   }
@@ -202,11 +294,7 @@ function syncLeaveMasterActiveStaffCore_() {
  * STATUS accepts ACTIVE, ACTIVE., ACTIVE , etc.
  */
 function fetchActiveStaffFromEmployeeMasterByHeaders_() {
-  // NOTE: These are expected to exist globally (from Hash script) OR declare them in ONE place only.
-  // const EMPLOYEE_MASTER_SPREADSHEET_ID = "...";
-  // const EMPLOYEE_MASTER_GID = ...;
-
-  const emSS = SpreadsheetApp.openById(EMPLOYEE_MASTER_SPREADSHEET_ID);
+  const emSS    = SpreadsheetApp.openById(EMPLOYEE_MASTER_SPREADSHEET_ID);
   const emSheet = getSheetByGid_(emSS, EMPLOYEE_MASTER_GID);
   if (!emSheet) throw new Error("Employee Master sheet not found by given GID.");
 
@@ -223,10 +311,10 @@ function fetchActiveStaffFromEmployeeMasterByHeaders_() {
   const header = (rows[0] || []).map(h => normalizeCell_(h));
   const idx = (h) => header.indexOf(normalizeCell_(h));
 
-  const idIdx = idx(EM_HEADERS.ID);
-  const nameIdx = idx(EM_HEADERS.NAME);
-  const catIdx = idx(EM_HEADERS.CATEGORY);
-  const dojIdx = idx(EM_HEADERS.DOJ);
+  const idIdx     = idx(EM_HEADERS.ID);
+  const nameIdx   = idx(EM_HEADERS.NAME);
+  const catIdx    = idx(EM_HEADERS.CATEGORY);
+  const dojIdx    = idx(EM_HEADERS.DOJ);
   const statusIdx = idx(EM_HEADERS.STATUS);
 
   if ([idIdx, nameIdx, catIdx, dojIdx, statusIdx].some(i => i < 0)) {
@@ -236,11 +324,11 @@ function fetchActiveStaffFromEmployeeMasterByHeaders_() {
   const map = {};
   for (let r = 1; r < rows.length; r++) {
     const row = rows[r] || [];
-    const id = normalizeCell_(row[idIdx]);
+    const id  = normalizeCell_(row[idIdx]);
     if (!id) continue;
 
     const statusRaw = normalizeCell_(row[statusIdx]).toUpperCase();
-    const category = normalizeCell_(row[catIdx]).toUpperCase();
+    const category  = normalizeCell_(row[catIdx]).toUpperCase();
 
     const isActive = statusRaw.startsWith("ACTIVE");
     if (!isActive) continue;
@@ -248,9 +336,9 @@ function fetchActiveStaffFromEmployeeMasterByHeaders_() {
 
     map[id] = {
       id,
-      name: normalizeCell_(row[nameIdx]),
+      name:     normalizeCell_(row[nameIdx]),
       category: "STAFF",
-      doj: row[dojIdx] || "",
+      doj:      row[dojIdx] || "",
     };
   }
 
@@ -265,13 +353,13 @@ function fetchActiveStaffFromEmployeeMasterByHeaders_() {
 function appendNewEmployeesByHeaders_(lmSheet, lmHeaderMap, employees) {
   if (!employees.length) return;
 
-  const idCol0 = lmHeaderMap[normalizeKey_(LM_HEADERS.ID)];
+  const idCol0   = lmHeaderMap[normalizeKey_(LM_HEADERS.ID)];
   const nameCol0 = lmHeaderMap[normalizeKey_(LM_HEADERS.NAME)];
-  const catCol0 = lmHeaderMap[normalizeKey_(LM_HEADERS.CATEGORY)];
-  const dojCol0 = lmHeaderMap[normalizeKey_(LM_HEADERS.DOJ)];
-  const elCol0 = lmHeaderMap[normalizeKey_(LM_HEADERS.EL)];
-  const clCol0 = lmHeaderMap[normalizeKey_(LM_HEADERS.CL)];
-  const slCol0 = lmHeaderMap[normalizeKey_(LM_HEADERS.SL)];
+  const catCol0  = lmHeaderMap[normalizeKey_(LM_HEADERS.CATEGORY)];
+  const dojCol0  = lmHeaderMap[normalizeKey_(LM_HEADERS.DOJ)];
+  const elCol0   = lmHeaderMap[normalizeKey_(LM_HEADERS.EL)];
+  const clCol0   = lmHeaderMap[normalizeKey_(LM_HEADERS.CL)];
+  const slCol0   = lmHeaderMap[normalizeKey_(LM_HEADERS.SL)];
 
   const requiredLastColIndex = Math.max(idCol0, nameCol0, catCol0, dojCol0, elCol0, clCol0, slCol0);
   const requiredCols = requiredLastColIndex + 1;
@@ -283,9 +371,9 @@ function appendNewEmployeesByHeaders_(lmSheet, lmHeaderMap, employees) {
   }
 
   // ✅ Find last real data row using ID.NO column only
-  const idCol1 = idCol0 + 1; // convert to 1-based
+  const idCol1     = idCol0 + 1;
   const lastDataRow = findLastDataRowByColumn_(lmSheet, idCol1);
-  const startRow = Math.max(2, lastDataRow + 1);
+  const startRow    = Math.max(2, lastDataRow + 1);
   const neededLastRow = startRow + employees.length - 1;
 
   // ✅ Ensure enough rows exist
@@ -298,15 +386,13 @@ function appendNewEmployeesByHeaders_(lmSheet, lmHeaderMap, employees) {
 
   const out = employees.map(e => {
     const row = new Array(width).fill("");
-    row[idCol0] = e.id;
+    row[idCol0]   = e.id;
     row[nameCol0] = e.name;
-    row[catCol0] = e.category; // "STAFF"
-    row[dojCol0] = e.doj;
-
-    // default balances
-    row[elCol0] = "";
-    row[clCol0] = "";
-    row[slCol0] = "";
+    row[catCol0]  = e.category;
+    row[dojCol0]  = e.doj;
+    row[elCol0]   = "";
+    row[clCol0]   = "";
+    row[slCol0]   = "";
     return row;
   });
 
@@ -319,7 +405,7 @@ function appendNewEmployeesByHeaders_(lmSheet, lmHeaderMap, employees) {
  */
 function findLastDataRowByColumn_(sheet, col1Based) {
   const maxRows = sheet.getMaxRows();
-  const values = sheet.getRange(1, col1Based, maxRows, 1).getValues();
+  const values  = sheet.getRange(1, col1Based, maxRows, 1).getValues();
 
   for (let i = values.length - 1; i >= 0; i--) {
     const v = String(values[i][0] || "").trim();
@@ -335,7 +421,7 @@ function getHeaderIndexMap_(sheet, headerRowNum) {
   const map = {};
   for (let c = 0; c < headers.length; c++) {
     const key = normalizeKey_(headers[c]);
-    if (key) map[key] = c; // 0-based
+    if (key) map[key] = c;
   }
   return map;
 }
@@ -361,8 +447,8 @@ function normalizeDateComparable_(v) {
   if (!v) return "";
   if (Object.prototype.toString.call(v) === "[object Date]" && !isNaN(v.getTime())) {
     const yyyy = v.getFullYear();
-    const mm = String(v.getMonth() + 1).padStart(2, "0");
-    const dd = String(v.getDate()).padStart(2, "0");
+    const mm   = String(v.getMonth() + 1).padStart(2, "0");
+    const dd   = String(v.getDate()).padStart(2, "0");
     return `${yyyy}-${mm}-${dd}`;
   }
   return normalizeCell_(v);
